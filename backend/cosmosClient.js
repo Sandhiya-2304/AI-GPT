@@ -1,35 +1,44 @@
+
 const { CosmosClient } = require("@azure/cosmos");
 require("dotenv").config();
 const { generateChatTitle } = require("./openai");
 
 const client = new CosmosClient({
   endpoint: process.env.COSMOS_ENDPOINT,
-  key: process.env.COSMOS_KEY
+  key: process.env.COSMOS_KEY,
+  connectionTimeout: 30000,
 });
 
 let containerInstance = null;
 
-/* ================= INIT COSMOS ================= */
+const log = {
+  info: (msg) => console.log(`🟦 [INFO] ${msg}`),
+  cosmos: (msg) => console.log(`🛢 [COSMOS] ${msg}`),
+  thread: (msg) => console.log(`🧵 [THREAD] ${msg}`),
+  delete: (msg) => console.log(`🗑 [DELETE] ${msg}`),
+  error: (msg) => console.error(`❌ [ERROR] ${msg}`),
+};
+
 async function initCosmos() {
   if (containerInstance) return containerInstance;
 
   const dbName = process.env.COSMOS_DATABASE_NAME || "TASK-v2";
-  const containerName =
-    process.env.COSMOS_CONTAINER_NAME || "new-chat-container-v2";
+  const containerName = process.env.COSMOS_CONTAINER_NAME || "new-chat-container-v2";
 
   if (!process.env.COSMOS_ENDPOINT) {
     throw new Error("COSMOS_ENDPOINT missing in .env");
   }
 
   let db;
-
   try {
     db = client.database(dbName);
     await db.read();
+    log.cosmos(`Database ready: ${dbName}`);
   } catch (err) {
     if (err.code === 404) {
       const result = await client.databases.create({ id: dbName });
       db = result.database;
+      log.cosmos(`Database created: ${dbName}`);
     } else {
       throw err;
     }
@@ -41,10 +50,12 @@ async function initCosmos() {
       partitionKey: { paths: ["/chatId"] }
     });
     containerInstance = result.container;
+    log.cosmos(`Container created: ${containerName}`);
   } catch (err) {
     if (err.code === 409) {
       containerInstance = db.container(containerName);
       await containerInstance.read();
+      log.cosmos(`Container ready: ${containerName}`);
     } else {
       throw err;
     }
@@ -53,43 +64,33 @@ async function initCosmos() {
   return containerInstance;
 }
 
-/* ================= SAVE MESSAGE (FIXED CORE BUG HERE) ================= */
 async function saveMessageToCosmos(
   chatId,
   userId,
   sender,
   messageText,
   contentType = "text",
-  imageUrl = null
+  mediaUrl = null
 ) {
   const container = await initCosmos();
 
-  const id = `msg_${Date.now()}_${Math.random()
-    .toString(36)
-    .substring(2, 7)}`;
+  const id = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-const messageItem = {
-  id,
-  chatId,
-  userId,
-  sender,
-  type: "message",
-  contentType, // text | image | video
-
-  message: contentType === "text" ? messageText : null,
-
-  // unified media field (IMPORTANT for frontend)
-  mediaUrl:
-    contentType === "image" || contentType === "video"
-      ? imageUrl
-      : null,
-
-  timestamp: new Date().toISOString()
-};
+  const messageItem = {
+    id,
+    chatId,
+    userId,
+    sender,
+    type: "message",
+    contentType,
+    message: contentType === "text" ? messageText : null,
+    text: contentType === "text" ? messageText : null,
+    mediaUrl: mediaUrl || null,
+    timestamp: new Date().toISOString()
+  };
 
   await container.items.create(messageItem);
 
-  /* ================= THREAD CREATION ================= */
   if (sender === "user") {
     const { resources } = await container.items
       .query({
@@ -108,7 +109,9 @@ const messageItem = {
       .fetchAll();
 
     if (resources.length === 0) {
-      const title = await generateChatTitle(messageText);
+      const title = await generateChatTitle(
+        contentType === "text" ? messageText : `${contentType} generation request`
+      );
 
       await container.items.create({
         id: chatId,
@@ -119,13 +122,14 @@ const messageItem = {
         title,
         timestamp: new Date().toISOString()
       });
+
+      log.thread(`Created thread: ${title}`);
     }
   }
 
   return true;
 }
 
-/* ================= GET MESSAGES ================= */
 async function getMessagesFromCosmos(chatId, userId) {
   const container = await initCosmos();
 
@@ -134,23 +138,24 @@ async function getMessagesFromCosmos(chatId, userId) {
       .query({
         query: `
           SELECT * FROM c
-          WHERE c.chatId = "${chatId}"
-          AND c.userId = "${userId}"
+          WHERE c.chatId = @chatId
+          AND c.userId = @userId
           AND c.type = "message"
-        `
+        `,
+        parameters: [
+          { name: "@chatId", value: chatId },
+          { name: "@userId", value: userId }
+        ]
       })
       .fetchAll();
 
-    return resources.sort(
-      (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
-    );
+    return resources.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
   } catch (error) {
-    console.error("getMessagesFromCosmos error:", error);
+    log.error(`getMessagesFromCosmos failed: ${error.message}`);
     return [];
   }
 }
 
-/* ================= THREADS ================= */
 async function getSidebarThreads(userId) {
   const container = await initCosmos();
 
@@ -183,9 +188,10 @@ async function getSidebarThreads(userId) {
   );
 }
 
-/* ================= DELETE THREAD ================= */
 async function deleteChatThread(chatId, userId) {
   const container = await initCosmos();
+
+  log.delete(`Deleting chatId=${chatId} userId=${userId}`);
 
   const { resources } = await container.items
     .query({
@@ -201,11 +207,13 @@ async function deleteChatThread(chatId, userId) {
     })
     .fetchAll();
 
-  for (const msg of resources) {
+  for (const item of resources) {
     try {
-      await container.item(msg.id, msg.chatId).delete();
+      await container.item(item.id, item.chatId).delete();
     } catch (err) {
-      console.error("Delete error:", err.message);
+      if (err.code !== 404) {
+        log.error(`Delete failed for ${item.id}: ${err.message}`);
+      }
     }
   }
 
